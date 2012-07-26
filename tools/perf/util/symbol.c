@@ -1184,6 +1184,29 @@ static int dso__swap_init(struct dso *dso, unsigned char eidata)
 	return 0;
 }
 
+/*
+ * Find the phdr for the segment containing sym.
+ */
+static bool elf_find_sym_phdr(Elf *elf, GElf_Ehdr *ehdr, GElf_Sym *sym,
+			      GElf_Phdr *phdr)
+{
+	int i;
+
+	for (i = 0; i < ehdr->e_phnum; i++) {
+		if (gelf_getphdr(elf, i, phdr) == NULL)
+			continue;
+
+		if (phdr->p_type == PT_LOAD &&
+		    phdr->p_vaddr <= sym->st_value &&
+		    (sym->st_value + sym->st_size <=
+		     phdr->p_vaddr + phdr->p_memsz)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static int dso__load_sym(struct dso *dso, struct map *map, const char *name,
 			 int fd, symbol_filter_t filter, int kmodule,
 			 int want_symtab)
@@ -1269,12 +1292,14 @@ static int dso__load_sym(struct dso *dso, struct map *map, const char *name,
 
 	memset(&sym, 0, sizeof(sym));
 	if (dso->kernel == DSO_TYPE_USER) {
-		dso->adjust_symbols = (ehdr.e_type == ET_EXEC ||
-				elf_section_by_name(elf, &ehdr, &shdr,
-						     ".gnu.prelink_undo",
-						     NULL) != NULL);
-	} else {
-		dso->adjust_symbols = 0;
+		/*
+		 * We used to only adjust ET_EXEC and prelinked objects.
+		 * However, any dso can have segments with a non-zero virtual
+		 * address, so now we adjust everything.  Most position
+		 * independent shared libraries request a segment load address
+		 * of zero, so for them this is a no-op.
+		 */
+		dso->adjust_symbols = 1;
 	}
 	elf_symtab__for_each_symbol(syms, nr_syms, idx, sym) {
 		struct symbol *f;
@@ -1374,11 +1399,22 @@ static int dso__load_sym(struct dso *dso, struct map *map, const char *name,
 		}
 
 		if (curr_dso->adjust_symbols) {
-			pr_debug4("%s: adjusting symbol: st_value: %#" PRIx64 " "
-				  "sh_addr: %#" PRIx64 " sh_offset: %#" PRIx64 "\n", __func__,
-				  (u64)sym.st_value, (u64)shdr.sh_addr,
-				  (u64)shdr.sh_offset);
-			sym.st_value -= shdr.sh_addr - shdr.sh_offset;
+			GElf_Phdr phdr;
+
+			/*
+			 * We adjust based on segment virtual address instead of
+			 * section headers like we used to.  The loader uses
+			 * phdrs to do the mapping, so they are more reliable,
+			 * especially if objcopy has been used to separate the
+			 * debug info.
+			 */
+			if (elf_find_sym_phdr(elf, &ehdr, &sym, &phdr)) {
+				pr_debug4("%s: adjusting symbol: st_value: %#"
+					  PRIx64 " p_vaddr: %#" PRIx64
+					  "\n", __func__, (u64)sym.st_value,
+					  (u64)phdr.p_vaddr);
+				sym.st_value -= phdr.p_vaddr - phdr.p_offset;
+			}
 		}
 		/*
 		 * We need to figure out if the object was created from C++ sources
